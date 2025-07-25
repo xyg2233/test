@@ -1,0 +1,198 @@
+name: Sync from Gitee with Smart Backup (Beijing Time)
+on:
+  schedule:
+    - cron: '0 * * * *'  # 每小时自动检查（北京时间）
+  workflow_dispatch:     # 支持手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Asia/Shanghai  # 强制使用北京时间 (UTC+8)
+    steps:
+      - name: Checkout GitHub Repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Initialize Environment
+        run: |
+          mkdir -p 历史线路包
+          touch 历史线路包/last_hashes.txt
+          chmod 644 历史线路包/last_hashes.txt
+          # 显示当前时间用于调试
+          date
+
+      - name: Backup Workflow File
+        run: cp .github/workflows/sync.yml /tmp/sync.yml
+
+      - name: Protect Backup Directory
+        run: |
+          if [ -d "历史线路包" ]; then
+            mv 历史线路包 /tmp/history_backup
+          fi
+
+      - name: Fetch and Overwrite from Gitee
+        run: |
+          git remote add gitee https://gitee.com/xygg23333/test.git || true
+          git fetch gitee
+          git reset --hard gitee/master
+
+      - name: Restore Backup Directory
+        run: |
+          if [ -d "/tmp/history_backup" ]; then
+            mv /tmp/history_backup 历史线路包
+            chmod 644 历史线路包/last_hashes.txt
+          fi
+
+      - name: Restore Workflow File
+        run: |
+          mkdir -p .github/workflows
+          cp /tmp/sync.yml .github/workflows/sync.yml
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add .github/workflows/sync.yml
+          git commit -m "Restore sync.yml after sync" || echo "无需提交"
+
+      - name: Smart Atomic Backup (Preserve Root File)
+        id: backup
+        run: |
+          #!/bin/bash
+          set -eo pipefail
+
+          # 配置参数
+          SRC_FILE="单线路.zip"
+          BACKUP_DIR="历史线路包"
+          BASE_NAME="单线路"
+          DATE_SUFFIX=$(TZ=Asia/Shanghai date +"%y.%m.%d")  # 强制使用北京时间
+
+          # 确保备份目录存在
+          mkdir -p "$BACKUP_DIR"
+
+          # 原子化备份函数
+          atomic_backup() {
+            # 1. 获取文件锁（防止并发冲突）
+            exec 9>"$BACKUP_DIR/.lock"
+            if ! flock -x -w 10 9; then
+              echo "::error::无法获取文件锁，操作超时"
+              exit 1
+            fi
+
+            # 2. 检查源文件是否存在
+            if [ ! -f "$SRC_FILE" ]; then
+              echo "::warning::源文件不存在: $SRC_FILE"
+              return 0
+            fi
+
+            # 3. 计算当前文件的哈希值
+            CURRENT_HASH=$(sha256sum "$SRC_FILE" | awk '{print $1}')
+
+            # 4. 检查是否已存在相同内容的备份
+            if [ -f "$BACKUP_DIR/last_hashes.txt" ]; then
+              # 4.1 快速比对：检查哈希记录
+              OLD_HASH=$(grep "^$BASE_NAME:" "$BACKUP_DIR/last_hashes.txt" | cut -d: -f2 || echo "")
+              if [ "$CURRENT_HASH" == "$OLD_HASH" ]; then
+                echo "::notice::文件未变化，跳过备份"
+                return 0
+              fi
+
+              # 4.2 彻底比对：检查所有备份文件
+              for backup_file in "$BACKUP_DIR"/"${BASE_NAME}"*.zip; do
+                if [ -f "$backup_file" ]; then
+                  BACKUP_HASH=$(sha256sum "$backup_file" | awk '{print $1}')
+                  if [ "$BACKUP_HASH" == "$CURRENT_HASH" ]; then
+                    echo "::notice::相同内容已存在于历史备份中，跳过备份"
+                    # 更新哈希记录（但不再重复备份）
+                    TEMP_HASHFILE=$(mktemp)
+                    grep -v "^$BASE_NAME:" "$BACKUP_DIR/last_hashes.txt" > "$TEMP_HASHFILE" 2>/dev/null || true
+                    echo "$BASE_NAME:$CURRENT_HASH" >> "$TEMP_HASHFILE"
+                    mv "$TEMP_HASHFILE" "$BACKUP_DIR/last_hashes.txt"
+                    return 0
+                  fi
+                fi
+              done
+            fi
+
+            # 5. 生成备份文件名
+            get_next_version() {
+              # 获取当天所有备份文件
+              FILES=($(ls -v "$BACKUP_DIR/${BASE_NAME}${DATE_SUFFIX}"*.zip 2>/dev/null))
+              
+              if [ ${#FILES[@]} -eq 0 ]; then
+                # 当天首次备份
+                echo "0"
+              else
+                # 获取最新文件的版本号
+                LATEST_FILE="${FILES[-1]}"
+                if [[ "$LATEST_FILE" =~ ${DATE_SUFFIX}\.([0-9]+)\.zip$ ]]; then
+                  # 已有版本号的文件
+                  echo "$((BASH_REMATCH[1] + 1))"
+                elif [[ "$LATEST_FILE" =~ ${DATE_SUFFIX}\.zip$ ]]; then
+                  # 首次备份（无版本号）
+                  echo "1"
+                else
+                  # 其他情况
+                  echo "0"
+                fi
+              fi
+            }
+
+            VERSION=$(get_next_version)
+            if [ "$VERSION" -eq 0 ]; then
+              # 首次备份使用简洁文件名（隐藏.0）
+              BACKUP_NAME="${BASE_NAME}${DATE_SUFFIX}.zip"
+            else
+              # 后续备份添加版本号
+              BACKUP_NAME="${BASE_NAME}${DATE_SUFFIX}.${VERSION}.zip"
+            fi
+
+            # 6. 执行备份（复制到历史目录，不修改源文件）
+            echo "::notice::检测到新版本，备份中: $BACKUP_NAME"
+            TEMP_FILE=$(mktemp)
+            cp "$SRC_FILE" "$TEMP_FILE"
+            mv "$TEMP_FILE" "$BACKUP_DIR/$BACKUP_NAME"
+
+            # 7. 更新哈希记录
+            TEMP_HASHFILE=$(mktemp)
+            grep -v "^$BASE_NAME:" "$BACKUP_DIR/last_hashes.txt" > "$TEMP_HASHFILE" 2>/dev/null || true
+            echo "$BASE_NAME:$CURRENT_HASH" >> "$TEMP_HASHFILE"
+            mv "$TEMP_HASHFILE" "$BACKUP_DIR/last_hashes.txt"
+          }
+
+          # 执行备份
+          atomic_backup
+
+      - name: Verify Backup Integrity
+        run: |
+          echo "=== 备份验证报告 ==="
+          echo "当前时间: $(TZ=Asia/Shanghai date)"
+          echo "根目录文件哈希:"
+          sha256sum 单线路.zip 2>/dev/null || echo "文件不存在"
+          echo "最新备份文件哈希:"
+          ls -v 历史线路包/单线路*.zip 2>/dev/null | tail -n 1 | xargs sha256sum 2>/dev/null || echo "无备份文件"
+          echo "哈希记录:"
+          grep "^单线路:" 历史线路包/last_hashes.txt 2>/dev/null || echo "无记录"
+
+      - name: Auto Extract ZIP
+        run: |
+          if [ -f "单线路.zip" ]; then
+            mkdir -p 单线路文件/
+            if ! unzip -o 单线路.zip -d 单线路文件/; then
+              echo "::error::解压失败"
+              exit 1
+            fi
+            echo "解压成功 → 单线路文件/"
+          fi
+
+      - name: Commit Changes
+        run: |
+          git add 历史线路包/ 单线路文件/
+          git commit -m "Auto backup [skip ci] $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" || echo "::notice::无新变更可提交"
+
+      - name: Push to GitHub
+        run: git push --force origin HEAD:master
+
+      - name: Cleanup
+        run: |
+          rm -f /tmp/sync.yml
+          rm -rf /tmp/history_backup
