@@ -1,7 +1,7 @@
 name: Sync from Gitee with Smart Backup (Beijing Time)
 on:
-  schedule:
-    - cron: '0 16-23,0-15 * * *'  # 精确覆盖北京时间全天（0-23点）
+  #schedule:
+    #- cron: '0 16-23,0-15 * * *'  # 精确覆盖北京时间全天（0-23点）
       # UTC时间16:00-23:00 → 北京时间0:00-7:00
       # UTC时间0:00-15:00 → 北京时间8:00-23:00
   workflow_dispatch:             # 支持手动触发
