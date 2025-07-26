@@ -1,27 +1,37 @@
 name: Sync from Gitee with Smart Backup (Beijing Time)
 on:
-  #schedule:
-   # - cron: '0 * * * *'  # 每小时自动检查（北京时间）
-  workflow_dispatch:     # 支持手动触发
+  schedule:
+    - cron: '0 16-23,0-7 * * *'  # UTC时间16-23点和0-7点 → 北京时间0-23点整点
+  workflow_dispatch:             # 支持手动触发
+
+env:
+  TZ: Asia/Shanghai              # 全局时区设置（影响所有步骤）
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    env:
-      TZ: Asia/Shanghai  # 强制使用北京时间 (UTC+8)
+    timeout-minutes: 30
     steps:
+      # ====================== 时区验证 ======================
+      - name: Verify Beijing Time
+        run: |
+          echo "UTC时间: $(date -u '+%Y-%m-%d %H:%M:%S')"
+          echo "北京时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "时区配置: $(timedatectl show --value -p Timezone || echo '系统默认时区')"
+
+      # ====================== 核心同步流程 ======================
       - name: Checkout GitHub Repo
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Initialize Environment
         run: |
           mkdir -p 历史线路包
           touch 历史线路包/last_hashes.txt
           chmod 644 历史线路包/last_hashes.txt
-          # 显示当前时间用于调试
-          date
+          echo "初始化完成 [$(date '+%m-%d %H:%M:%S')]"
 
       - name: Backup Workflow File
         run: cp .github/workflows/sync.yml /tmp/sync.yml
@@ -30,6 +40,7 @@ jobs:
         run: |
           if [ -d "历史线路包" ]; then
             mv 历史线路包 /tmp/history_backup
+            echo "备份目录已保护 [$(date '+%H:%M:%S')]"
           fi
 
       - name: Fetch and Overwrite from Gitee
@@ -37,12 +48,16 @@ jobs:
           git remote add gitee https://gitee.com/xygg23333/test.git || true
           git fetch gitee
           git reset --hard gitee/master
+          git clean -fd
+          echo "同步完成 [$(date '+%H:%M:%S')]"
 
+      # ====================== 备份恢复 ======================
       - name: Restore Backup Directory
         run: |
           if [ -d "/tmp/history_backup" ]; then
             mv /tmp/history_backup 历史线路包
             chmod 644 历史线路包/last_hashes.txt
+            echo "备份已恢复 [$(date '+%H:%M:%S')]"
           fi
 
       - name: Restore Workflow File
@@ -52,147 +67,98 @@ jobs:
           git config --global user.name "GitHub Actions Bot"
           git config --global user.email "actions@github.com"
           git add .github/workflows/sync.yml
-          git commit -m "Restore sync.yml after sync" || echo "无需提交"
+          git commit -m "恢复工作流文件 [$(date '+%m-%d %H:%M')]" || echo "无变更可提交"
 
-      - name: Smart Atomic Backup (Preserve Root File)
+      # ====================== 智能备份 ======================
+      - name: Smart Atomic Backup
         id: backup
         run: |
           #!/bin/bash
           set -eo pipefail
+          
+          # 强制使用北京时间
+          export TZ=Asia/Shanghai
+          echo "备份开始 [$(date '+%H:%M:%S')]"
 
           # 配置参数
           SRC_FILE="单线路.zip"
           BACKUP_DIR="历史线路包"
           BASE_NAME="单线路"
-          DATE_SUFFIX=$(TZ=Asia/Shanghai date +"%y.%m.%d")  # 强制使用北京时间
+          DATE_SUFFIX=$(date +"%y.%m.%d")  # 自动使用时区
 
-          # 确保备份目录存在
-          mkdir -p "$BACKUP_DIR"
-
-          # 原子化备份函数
+          # 原子备份函数
           atomic_backup() {
-            # 1. 获取文件锁（防止并发冲突）
+            # 获取文件锁（防止并发）
             exec 9>"$BACKUP_DIR/.lock"
-            if ! flock -x -w 10 9; then
-              echo "::error::无法获取文件锁，操作超时"
-              exit 1
-            fi
+            flock -x -w 10 9 || { echo "::error::获取锁超时"; return 1; }
 
-            # 2. 检查源文件是否存在
-            if [ ! -f "$SRC_FILE" ]; then
-              echo "::warning::源文件不存在: $SRC_FILE"
-              return 0
-            fi
+            # 检查源文件
+            [ -f "$SRC_FILE" ] || { echo "::warning::源文件不存在"; return 0; }
 
-            # 3. 计算当前文件的哈希值
+            # 计算哈希
             CURRENT_HASH=$(sha256sum "$SRC_FILE" | awk '{print $1}')
+            echo "文件哈希: ${CURRENT_HASH:0:8}..."
 
-            # 4. 检查是否已存在相同内容的备份
+            # 检查重复备份
             if [ -f "$BACKUP_DIR/last_hashes.txt" ]; then
-              # 4.1 快速比对：检查哈希记录
               OLD_HASH=$(grep "^$BASE_NAME:" "$BACKUP_DIR/last_hashes.txt" | cut -d: -f2 || echo "")
-              if [ "$CURRENT_HASH" == "$OLD_HASH" ]; then
-                echo "::notice::文件未变化，跳过备份"
-                return 0
-              fi
-
-              # 4.2 彻底比对：检查所有备份文件
-              for backup_file in "$BACKUP_DIR"/"${BASE_NAME}"*.zip; do
-                if [ -f "$backup_file" ]; then
-                  BACKUP_HASH=$(sha256sum "$backup_file" | awk '{print $1}')
-                  if [ "$BACKUP_HASH" == "$CURRENT_HASH" ]; then
-                    echo "::notice::相同内容已存在于历史备份中，跳过备份"
-                    # 更新哈希记录（但不再重复备份）
-                    TEMP_HASHFILE=$(mktemp)
-                    grep -v "^$BASE_NAME:" "$BACKUP_DIR/last_hashes.txt" > "$TEMP_HASHFILE" 2>/dev/null || true
-                    echo "$BASE_NAME:$CURRENT_HASH" >> "$TEMP_HASHFILE"
-                    mv "$TEMP_HASHFILE" "$BACKUP_DIR/last_hashes.txt"
-                    return 0
-                  fi
-                fi
-              done
+              [ "$CURRENT_HASH" == "$OLD_HASH" ] && { echo "::notice::无变化"; return 0; }
             fi
 
-            # 5. 生成备份文件名
-            get_next_version() {
-              # 获取当天所有备份文件
-              FILES=($(ls -v "$BACKUP_DIR/${BASE_NAME}${DATE_SUFFIX}"*.zip 2>/dev/null))
-              
-              if [ ${#FILES[@]} -eq 0 ]; then
-                # 当天首次备份
-                echo "0"
-              else
-                # 获取最新文件的版本号
-                LATEST_FILE="${FILES[-1]}"
-                if [[ "$LATEST_FILE" =~ ${DATE_SUFFIX}\.([0-9]+)\.zip$ ]]; then
-                  # 已有版本号的文件
-                  echo "$((BASH_REMATCH[1] + 1))"
-                elif [[ "$LATEST_FILE" =~ ${DATE_SUFFIX}\.zip$ ]]; then
-                  # 首次备份（无版本号）
-                  echo "1"
-                else
-                  # 其他情况
-                  echo "0"
-                fi
-              fi
+            # 生成版本号
+            VERSION=$(ls -v "$BACKUP_DIR/${BASE_NAME}${DATE_SUFFIX}"*.zip 2>/dev/null | tail -n1 | 
+                      grep -oP "(?<=\.)\d+(?=\.zip)" | awk '{print $1+1}' || echo "0")
+            
+            # 创建备份
+            BACKUP_NAME="${BASE_NAME}${DATE_SUFFIX}$([ "$VERSION" -gt 0 ] && echo ".$VERSION").zip"
+            TEMP_FILE=$(mktemp)
+            cp "$SRC_FILE" "$TEMP_FILE" && mv "$TEMP_FILE" "$BACKUP_DIR/$BACKUP_NAME" || {
+              echo "::error::备份失败"; return 1
             }
 
-            VERSION=$(get_next_version)
-            if [ "$VERSION" -eq 0 ]; then
-              # 首次备份使用简洁文件名（隐藏.0）
-              BACKUP_NAME="${BASE_NAME}${DATE_SUFFIX}.zip"
-            else
-              # 后续备份添加版本号
-              BACKUP_NAME="${BASE_NAME}${DATE_SUFFIX}.${VERSION}.zip"
-            fi
+            # 更新哈希记录
+            TEMP_HASH=$(mktemp)
+            grep -v "^$BASE_NAME:" "$BACKUP_DIR/last_hashes.txt" 2>/dev/null > "$TEMP_HASH" || true
+            echo "$BASE_NAME:$CURRENT_HASH" >> "$TEMP_HASH"
+            mv "$TEMP_HASH" "$BACKUP_DIR/last_hashes.txt"
 
-            # 6. 执行备份（复制到历史目录，不修改源文件）
-            echo "::notice::检测到新版本，备份中: $BACKUP_NAME"
-            TEMP_FILE=$(mktemp)
-            cp "$SRC_FILE" "$TEMP_FILE"
-            mv "$TEMP_FILE" "$BACKUP_DIR/$BACKUP_NAME"
-
-            # 7. 更新哈希记录
-            TEMP_HASHFILE=$(mktemp)
-            grep -v "^$BASE_NAME:" "$BACKUP_DIR/last_hashes.txt" > "$TEMP_HASHFILE" 2>/dev/null || true
-            echo "$BASE_NAME:$CURRENT_HASH" >> "$TEMP_HASHFILE"
-            mv "$TEMP_HASHFILE" "$BACKUP_DIR/last_hashes.txt"
+            echo "::notice::备份成功: $BACKUP_NAME"
+            return 0
           }
 
-          # 执行备份
-          atomic_backup
+          atomic_backup || exit 1
 
-      - name: Verify Backup Integrity
+      # ====================== 后续处理 ======================
+      - name: Verify Backup
         run: |
-          echo "=== 备份验证报告 ==="
-          echo "当前时间: $(TZ=Asia/Shanghai date)"
-          echo "根目录文件哈希:"
-          sha256sum 单线路.zip 2>/dev/null || echo "文件不存在"
-          echo "最新备份文件哈希:"
-          ls -v 历史线路包/单线路*.zip 2>/dev/null | tail -n 1 | xargs sha256sum 2>/dev/null || echo "无备份文件"
+          echo "=== 验证报告 [$(date '+%H:%M:%S')] ==="
+          echo "备份文件:"
+          ls -l 历史线路包/ || echo "无备份"
           echo "哈希记录:"
-          grep "^单线路:" 历史线路包/last_hashes.txt 2>/dev/null || echo "无记录"
+          cat 历史线路包/last_hashes.txt || echo "无记录"
 
       - name: Auto Extract ZIP
         run: |
           if [ -f "单线路.zip" ]; then
+            echo "解压中 [$(date '+%H:%M:%S')]..."
             mkdir -p 单线路文件/
-            if ! unzip -o 单线路.zip -d 单线路文件/; then
-              echo "::error::解压失败"
-              exit 1
-            fi
-            echo "解压成功 → 单线路文件/"
+            unzip -o 单线路.zip -d 单线路文件/ && echo "解压完成" || {
+              echo "::error::解压失败"; exit 1
+            }
           fi
 
       - name: Commit Changes
         run: |
-          git add 历史线路包/ 单线路文件/
-          git commit -m "Auto backup [skip ci] $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" || echo "::notice::无新变更可提交"
+          git add 历史线路包/ 单线路文件/ || echo "无需添加"
+          if ! git diff-index --quiet HEAD --; then
+            git commit -m "自动备份 [$(date '+%m-%d %H:%M')] [skip ci]" || exit 1
+            echo "变更已提交"
+          else
+            echo "::notice::无新变更"
+          fi
 
       - name: Push to GitHub
         run: git push --force origin HEAD:master
 
       - name: Cleanup
-        run: |
-          rm -f /tmp/sync.yml
-          rm -rf /tmp/history_backup
+        run: rm -rf /tmp/{sync.yml,history_backup}
